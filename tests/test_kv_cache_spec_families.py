@@ -329,3 +329,62 @@ def test_allocate_mamba_caches_delegates_to_model_hook():
 
     assert result == "allocated"
     assert received["specs"] == [[((3, 4, 128, 128), torch.float32)]]
+
+
+# --- per-layer block table expansion --------------------------------------
+
+
+def _table_stub(max_batch=4, max_blocks=3, layer_to_group=None, mamba_to_group=None):
+    stub = SimpleNamespace(
+        tt_max_batch_size=max_batch,
+        max_num_blocks_per_req=max_blocks,
+        _layer_to_group_idx=layer_to_group,
+        _mamba_layer_to_group_idx=mamba_to_group,
+    )
+    stub._expand_group_tables = partial(TTModelRunner._expand_group_tables, stub)
+    stub._block_tables_per_layer = partial(TTModelRunner._block_tables_per_layer, stub)
+    stub._mamba_block_tables_per_layer = partial(
+        TTModelRunner._mamba_block_tables_per_layer, stub
+    )
+    return stub
+
+
+def test_mamba_block_tables_are_none_without_a_mamba_group():
+    """Every model that does not opt in must see no behaviour change."""
+    stub = _table_stub(layer_to_group=[0, 0], mamba_to_group=None)
+
+    assert (
+        stub._mamba_block_tables_per_layer([torch.zeros(4, 3, dtype=torch.int32)])
+        is None
+    )
+
+
+def test_mamba_block_tables_follow_their_own_group_mapping():
+    """GDN layer i must get ITS group's table, independent of attention's."""
+    attn_table = torch.full((4, 3), 7, dtype=torch.int32)
+    mamba_a = torch.full((4, 3), 11, dtype=torch.int32)
+    mamba_b = torch.full((4, 3), 13, dtype=torch.int32)
+    stub = _table_stub(layer_to_group=[0], mamba_to_group=[1, 2, 1])
+
+    out = stub._mamba_block_tables_per_layer([attn_table, mamba_a, mamba_b])
+
+    assert len(out) == 3
+    assert torch.equal(out[0], mamba_a)
+    assert torch.equal(out[1], mamba_b)
+    assert torch.equal(out[2], mamba_a)
+    # Attention expansion is unaffected by the mamba mapping.
+    assert torch.equal(
+        stub._block_tables_per_layer([attn_table, mamba_a, mamba_b])[0], attn_table
+    )
+
+
+def test_expand_group_tables_pads_to_the_warmup_shape():
+    """Traces bake the page-table address, so the shape must be stable."""
+    narrow = torch.full((2, 2), 5, dtype=torch.int32)
+    stub = _table_stub(max_batch=4, max_blocks=3, mamba_to_group=[0])
+
+    (out,) = stub._mamba_block_tables_per_layer([narrow])
+
+    assert out.shape == (4, 3)
+    assert torch.equal(out[:2, :2], narrow)
+    assert int(out[3, 2]) == 0  # padding is zeroed

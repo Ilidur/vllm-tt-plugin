@@ -651,6 +651,24 @@ class TTModelRunner:
                 )
         return self.model.allocate_kv_cache(shape, dtype, len(per_layer_specs))
 
+    def _mamba_block_tables_per_layer(
+        self, block_tables_per_group: list[torch.Tensor]
+    ) -> list[torch.Tensor] | None:
+        """Per-GDN-layer block tables, or None when the model declares no
+        recurrent state.
+
+        The recurrent counterpart of ``_block_tables_per_layer``: entry ``i`` is
+        the block table for GDN layer ``i``'s kv_cache_group, so the model can
+        resolve which page of its block store a given sequence's state belongs
+        in. Recurrent pages are whole state snapshots, so a row holds one page
+        per block-aligned position rather than KV blocks.
+        """
+        if self._mamba_layer_to_group_idx is None:
+            return None
+        return self._expand_group_tables(
+            block_tables_per_group, self._mamba_layer_to_group_idx
+        )
+
     def _block_tables_per_layer(
         self, block_tables_per_group: list[torch.Tensor]
     ) -> list[torch.Tensor] | None:
@@ -666,7 +684,16 @@ class TTModelRunner:
         """
         if self._layer_to_group_idx is None:
             return None
-        result = [block_tables_per_group[g] for g in self._layer_to_group_idx]
+        return self._expand_group_tables(
+            block_tables_per_group, self._layer_to_group_idx
+        )
+
+    def _expand_group_tables(
+        self, block_tables_per_group: list[torch.Tensor], layer_to_group: list[int]
+    ) -> list[torch.Tensor]:
+        """Expand per-group tables to per-layer via ``layer_to_group``, padded
+        to the warmup shape so captured traces keep stable device addresses."""
+        result = [block_tables_per_group[g] for g in layer_to_group]
         # Pad to the warmup shape ``[max_batch, max_num_blocks_per_req]``.
         # The model side (``Transformer._page_tables_to_ttnn``) allocates
         # *persistent* ttnn device tensors at this shape during warmup so
@@ -1716,6 +1743,9 @@ class TTModelRunner:
             block_tables=block_tables,
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
+            mamba_block_tables_per_layer=self._mamba_block_tables_per_layer(
+                block_tables_per_group
+            ),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
             tt_sampling_params=tt_sampling_params,
@@ -2319,6 +2349,14 @@ class TTModelRunner:
         # and never see the kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        # Recurrent-state page tables, for models whose GDN/SSM layers keep a
+        # vLLM-owned block store (see allocate_mamba_cache_per_layer).
+        # getattr, not attribute access: submit_* is also called with
+        # duck-typed model inputs (the lane/block runner tests build
+        # SimpleNamespace stubs), and this field is optional by construction.
+        mamba_tables = getattr(model_input, "mamba_block_tables_per_layer", None)
+        if mamba_tables is not None:
+            kwargs["mamba_page_tables_per_layer"] = mamba_tables
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params

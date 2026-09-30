@@ -147,6 +147,11 @@ class TTModelInput:
     # None means no logprobs, 0 means sampled token only
     max_num_logprobs: list[int | None]
 
+    # Per-GDN/SSM-layer block tables, for hybrid recurrent models whose state
+    # lives in a vLLM-owned block store. None when the model declares no
+    # MambaSpec group, which is every model that does not opt in.
+    mamba_block_tables_per_layer: list[torch.Tensor] | None = None
+
     # Optional: tokens for sampling with penalties during decode
     prompt_tokens: torch.Tensor | None = None
     output_tokens: torch.Tensor | None = None

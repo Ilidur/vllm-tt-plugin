@@ -66,6 +66,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
+        _mamba_block_tables_per_layer=lambda _: None,
         _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
         _decode_state_slot_remap=lambda row_req_ids: None,
         _sampling_params_for_padded_decode=lambda params, req_indices, n: params,

@@ -306,6 +306,7 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
     runner = SimpleNamespace(
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
         _block_tables_per_layer=lambda _: None,
+        _mamba_block_tables_per_layer=lambda _: None,
         check_perform_device_sampling=lambda **_: True,
         model_config=SimpleNamespace(is_multimodal_model=False),
         requests={"request": request},
@@ -797,6 +798,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
         _decode_layout_changed_since_last_decode=False,
         _block_tables_per_layer=lambda _: None,
+        _mamba_block_tables_per_layer=lambda _: None,
         requests={"prompt": prompt, "waiting": waiting},
     )
     runner.check_perform_device_sampling = (
