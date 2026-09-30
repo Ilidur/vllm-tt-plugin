@@ -43,6 +43,26 @@ def _group(layer_names, spec):
     return SimpleNamespace(layer_names=list(layer_names), kv_cache_spec=spec)
 
 
+# One (4, 128, 128) fp32 recurrent-state page.
+_MAMBA_PAGE_BYTES = 4 * 128 * 128 * 4
+
+
+def _kv_cache_config(sizes_by_layer, num_blocks=9999):
+    """Config stub whose ``kv_cache_tensors`` give each layer its own size.
+
+    ``num_blocks`` is deliberately a decoy: the mamba path must derive its
+    block count per layer from that layer's own buffer, never from this
+    attention-group count.
+    """
+    return SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            SimpleNamespace(shared_by=[name], size=size)
+            for name, size in sizes_by_layer.items()
+        ],
+    )
+
+
 # --- dense per-family indexing -------------------------------------------
 
 
@@ -209,24 +229,65 @@ def test_build_per_mamba_layer_specs_indexes_densely():
         )
     ]
     stub = _runner_stub(num_mamba_layers=4)
-
-    per_layer = TTModelRunner._build_per_mamba_layer_specs(
-        stub, SimpleNamespace(num_blocks=5), groups
+    config = _kv_cache_config(
+        {name: _MAMBA_PAGE_BYTES * 5 for name in groups[0].layer_names}
     )
+
+    per_layer = TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
 
     assert len(per_layer) == 4
     assert all(buf == [((5, 4, 128, 128), torch.float32)] for buf in per_layer)
+
+
+def test_build_per_mamba_layer_specs_derives_blocks_per_layer_not_from_config():
+    """A mamba page is a whole state snapshot; the attention block count would
+    over-allocate by orders of magnitude, so it must not be used."""
+    spec = _mamba_spec(shapes=((4, 128, 128),), dtypes=(torch.float32,))
+    groups = [
+        _group(["model.layers.0.linear_attn", "model.layers.1.linear_attn"], spec)
+    ]
+    stub = _runner_stub(num_mamba_layers=2)
+    config = _kv_cache_config(
+        {
+            "model.layers.0.linear_attn": _MAMBA_PAGE_BYTES * 2,
+            "model.layers.1.linear_attn": _MAMBA_PAGE_BYTES * 7,
+        },
+        num_blocks=9999,
+    )
+
+    per_layer = TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
+
+    assert per_layer[0] == [((2, 4, 128, 128), torch.float32)]
+    assert per_layer[1] == [((7, 4, 128, 128), torch.float32)]
+
+
+def test_build_per_mamba_layer_specs_rejects_layer_with_no_tensor():
+    spec = _mamba_spec(shapes=((4, 128, 128),), dtypes=(torch.float32,))
+    groups = [_group(["model.layers.0.linear_attn"], spec)]
+    stub = _runner_stub(num_mamba_layers=1)
+
+    with pytest.raises(ValueError, match="No KVCacheTensor covers mamba layer"):
+        TTModelRunner._build_per_mamba_layer_specs(stub, _kv_cache_config({}), groups)
+
+
+def test_build_per_mamba_layer_specs_rejects_buffer_smaller_than_one_page():
+    spec = _mamba_spec(shapes=((4, 128, 128),), dtypes=(torch.float32,))
+    groups = [_group(["model.layers.0.linear_attn"], spec)]
+    stub = _runner_stub(num_mamba_layers=1)
+    config = _kv_cache_config({"model.layers.0.linear_attn": _MAMBA_PAGE_BYTES - 1})
+
+    with pytest.raises(ValueError, match="smaller than one"):
+        TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
 
 
 def test_build_per_mamba_layer_specs_rejects_uncovered_layer():
     spec = _mamba_spec(shapes=((4, 128, 128),), dtypes=(torch.float32,))
     groups = [_group(["model.layers.0.linear_attn"], spec)]
     stub = _runner_stub(num_mamba_layers=2)
+    config = _kv_cache_config({"model.layers.0.linear_attn": _MAMBA_PAGE_BYTES})
 
     with pytest.raises(ValueError, match="No KVCacheGroupSpec covers mamba"):
-        TTModelRunner._build_per_mamba_layer_specs(
-            stub, SimpleNamespace(num_blocks=1), groups
-        )
+        TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
 
 
 def test_allocate_mamba_caches_is_noop_without_mamba_groups():
@@ -245,10 +306,10 @@ def test_allocate_mamba_caches_requires_model_hook():
     groups = [_group(["model.layers.0.linear_attn"], spec)]
     stub = _runner_stub(num_mamba_layers=1, model=object())
 
+    config = _kv_cache_config({"model.layers.0.linear_attn": _MAMBA_PAGE_BYTES})
+
     with pytest.raises(NotImplementedError, match="allocate_mamba_cache_per_layer"):
-        TTModelRunner._allocate_mamba_caches(
-            stub, SimpleNamespace(num_blocks=1), groups
-        )
+        TTModelRunner._allocate_mamba_caches(stub, config, groups)
 
 
 def test_allocate_mamba_caches_delegates_to_model_hook():
@@ -262,10 +323,9 @@ def test_allocate_mamba_caches_delegates_to_model_hook():
             return "allocated"
 
     stub = _runner_stub(num_mamba_layers=1, model=_Model())
+    config = _kv_cache_config({"model.layers.0.linear_attn": _MAMBA_PAGE_BYTES * 3})
 
-    result = TTModelRunner._allocate_mamba_caches(
-        stub, SimpleNamespace(num_blocks=3), groups
-    )
+    result = TTModelRunner._allocate_mamba_caches(stub, config, groups)
 
     assert result == "allocated"
     assert received["specs"] == [[((3, 4, 128, 128), torch.float32)]]

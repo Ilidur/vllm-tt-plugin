@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import inspect
 import math
 import os
 import time
@@ -348,7 +349,18 @@ class TTWorker(WorkerBase):
         hook = getattr(model_cls, "get_kv_cache_spec", None)
         if hook is None:
             return None
-        spec = hook(self.vllm_config)
+        # A hook may additionally accept ``num_devices``. Recurrent-state
+        # (``MambaSpec``) layers must declare their own per-device state
+        # shapes, because only the model knows which axis it shards over --
+        # unlike ``AttentionSpec``, where the runner folds the factor in via
+        # ``_kv_cache_shape``. The mesh is live by the time this runs, but
+        # ``vllm_config`` does not carry its size (vLLM reports
+        # ``tensor_parallel_size=1`` for TT; the mesh handles TP internally).
+        # Passed only when accepted, so existing hooks keep their signature.
+        if "num_devices" in inspect.signature(hook).parameters:
+            spec = hook(self.vllm_config, num_devices=self.num_devices)
+        else:
+            spec = hook(self.vllm_config)
         if spec is None:
             return None
         if not isinstance(spec, dict) or not all(

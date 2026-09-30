@@ -849,14 +849,40 @@ class TTModelRunner:
         dense = _dense_layer_indices(
             name for group in mamba_groups for name in group.layer_names
         )
+        # Block count is per layer, derived from that layer's own buffer size,
+        # NOT from ``kv_cache_config.num_blocks`` (which is the attention
+        # group's count). Upstream does the same:
+        # ``num_blocks = raw_tensor.numel() // spec.page_size_bytes``. A mamba
+        # page is a whole per-sequence state snapshot and is far larger than an
+        # attention page, so reusing the attention count would over-allocate by
+        # orders of magnitude.
+        size_by_layer: dict[str, int] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for layer_name in kv_cache_tensor.shared_by:
+                size_by_layer[layer_name] = kv_cache_tensor.size
+
         per_layer: list[list[tuple[tuple[int, ...], Any]] | None] = [
             None
         ] * num_mamba_layers
         for group in mamba_groups:
             spec = group.kv_cache_spec
             assert isinstance(spec, MambaSpec)
-            buffers = self._mamba_cache_shapes(spec, kv_cache_config.num_blocks)
             for layer_name in group.layer_names:
+                size_bytes = size_by_layer.get(layer_name)
+                if size_bytes is None:
+                    raise ValueError(
+                        f"No KVCacheTensor covers mamba layer '{layer_name}'; "
+                        "every recurrent-state layer must appear in some "
+                        "kv_cache_tensors[i].shared_by"
+                    )
+                num_blocks = size_bytes // spec.page_size_bytes
+                if num_blocks < 1:
+                    raise ValueError(
+                        f"KVCacheTensor for mamba layer '{layer_name}' is "
+                        f"{size_bytes} bytes, smaller than one "
+                        f"{spec.page_size_bytes}-byte state page"
+                    )
+                buffers = self._mamba_cache_shapes(spec, num_blocks)
                 idx = dense[layer_name]
                 if not 0 <= idx < num_mamba_layers:
                     raise ValueError(
