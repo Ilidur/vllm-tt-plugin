@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
@@ -20,6 +21,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -101,6 +103,46 @@ def _parse_layer_index(layer_name: str) -> int:
             "TT spec hooks must use the '...layers.<idx>...' naming convention."
         )
     return int(match.group(1))
+
+
+def _dense_layer_indices(layer_names: Iterable[str]) -> dict[str, int]:
+    """Map each layer name to its dense index *within its own family*.
+
+    ``KVCacheGroupSpec.layer_names`` carries vLLM's global layer names, whose
+    ``...layers.<idx>...`` index counts every decoder layer. The TT model side
+    indexes each family separately — attention layer 0 is the first
+    *attention* layer, not decoder layer 0.
+
+    For attention-only models these coincide, because every decoder layer is an
+    attention layer; that includes sliding/full hybrids (Gemma3/4, GPT-OSS),
+    which is why using the global index directly worked until now. In an
+    attention+mamba hybrid it does not: the attention layers are a sparse
+    subset of the decoder depth (Qwen3.6-35B-A3B has 10 attention layers spread
+    across 40 decoder layers), so decoder index 35 must not be used to index a
+    10-entry attention array. Sorting a family's own names by global index and
+    enumerating recovers the dense index, and is the identity whenever the two
+    already agree.
+    """
+    ordered = sorted(layer_names, key=_parse_layer_index)
+    return {name: i for i, name in enumerate(ordered)}
+
+
+def _split_groups_by_family(
+    kv_cache_groups: list,
+) -> tuple[list, list]:
+    """Partition ``kv_cache_groups`` into (attention groups, mamba groups).
+
+    ``UniformTypeKVCacheSpecs`` wraps same-type per-layer specs and is only
+    emitted for attention today, so it is grouped with attention.
+    """
+    attention_groups = []
+    mamba_groups = []
+    for group in kv_cache_groups:
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            mamba_groups.append(group)
+        else:
+            attention_groups.append(group)
+    return attention_groups, mamba_groups
 
 
 @dataclass(frozen=True)
@@ -468,14 +510,30 @@ class TTModelRunner:
         # local parallel config is collapsed to DP=1 by upstream before the TT
         # worker loads the model.
         self._layer_to_group_idx: list[int] | None = None
+        self._mamba_layer_to_group_idx: list[int] | None = None
+        attention_groups, mamba_groups = _split_groups_by_family(kv_cache_groups)
         if len(kv_cache_groups) > 1:
             num_layers = self.model_config.get_num_layers_by_block_type(
                 self.parallel_config, "attention"
             )
+            # Dense *within the attention family*: in an attention+mamba hybrid
+            # the decoder index of an attention layer overshoots this array (see
+            # ``_dense_layer_indices``).
+            attn_dense = _dense_layer_indices(
+                name for group in attention_groups for name in group.layer_names
+            )
             mapping: list[int | None] = [None] * num_layers
             for g_idx, group in enumerate(kv_cache_groups):
+                if isinstance(group.kv_cache_spec, MambaSpec):
+                    continue
                 for layer_name in group.layer_names:
-                    idx = _parse_layer_index(layer_name)
+                    idx = attn_dense[layer_name]
+                    if not 0 <= idx < num_layers:
+                        raise ValueError(
+                            f"Attention layer '{layer_name}' maps to dense "
+                            f"index {idx}, out of range for {num_layers} "
+                            "attention layers"
+                        )
                     mapping[idx] = g_idx
             missing = [i for i, g in enumerate(mapping) if g is None]
             if missing:
@@ -486,7 +544,37 @@ class TTModelRunner:
                 )
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
+            if mamba_groups:
+                num_mamba_layers = self.model_config.get_num_layers_by_block_type(
+                    self.parallel_config, "mamba"
+                )
+                mamba_dense = _dense_layer_indices(
+                    name for group in mamba_groups for name in group.layer_names
+                )
+                mamba_mapping: list[int | None] = [None] * num_mamba_layers
+                for g_idx, group in enumerate(kv_cache_groups):
+                    if not isinstance(group.kv_cache_spec, MambaSpec):
+                        continue
+                    for layer_name in group.layer_names:
+                        idx = mamba_dense[layer_name]
+                        if not 0 <= idx < num_mamba_layers:
+                            raise ValueError(
+                                f"Mamba layer '{layer_name}' maps to dense "
+                                f"index {idx}, out of range for "
+                                f"{num_mamba_layers} mamba layers"
+                            )
+                        mamba_mapping[idx] = g_idx
+                missing_mamba = [i for i, g in enumerate(mamba_mapping) if g is None]
+                if missing_mamba:
+                    raise ValueError(
+                        f"No KVCacheGroupSpec covers mamba layer indices "
+                        f"{missing_mamba}; every mamba layer must appear in "
+                        "some group's layer_names."
+                    )
+                self._mamba_layer_to_group_idx = mamba_mapping  # type: ignore[assignment]
+
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        self.mamba_caches = self._allocate_mamba_caches(kv_cache_config, mamba_groups)
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -500,12 +588,21 @@ class TTModelRunner:
             # ``_HYBRID_KV_CACHE_GROUPS_ENABLED = False``: sliding layers 8x256,
             # full layers 1x512). We unwrap it to per-layer specs in
             # ``_build_per_layer_specs``, so accept it here too.
+            # ``MambaSpec`` groups carry recurrent (SSM/GDN) state rather than
+            # paged KV. Their pages hold whole per-sequence state snapshots, so
+            # the shape family differs from ``AttentionSpec`` (a tuple of
+            # arbitrary per-buffer shapes instead of one
+            # ``(blocks, heads, block_size, head_size)``) and they are handled
+            # by ``_build_per_mamba_layer_specs`` rather than
+            # ``_build_per_layer_specs``.
             if not isinstance(
-                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs)
+                group.kv_cache_spec,
+                (AttentionSpec, UniformTypeKVCacheSpecs, MambaSpec),
             ):
                 raise TypeError(
-                    f"Expected AttentionSpec/UniformTypeKVCacheSpecs for group "
-                    f"{group.layer_names}, got {type(group.kv_cache_spec).__name__}"
+                    f"Expected AttentionSpec/UniformTypeKVCacheSpecs/MambaSpec "
+                    f"for group {group.layer_names}, got "
+                    f"{type(group.kv_cache_spec).__name__}"
                 )
 
     def _kv_cache_shape(
@@ -616,7 +713,17 @@ class TTModelRunner:
         Single-group (uniform-attention) models keep the previous behavior:
         every layer gets a unique buffer and ``tensor_idx == layer_idx``.
         """
-        kv_cache_groups = kv_cache_config.kv_cache_groups
+        # Mamba groups carry recurrent state, not paged KV; they are allocated
+        # separately by ``_build_per_mamba_layer_specs``. Everything below
+        # therefore reasons only about the attention family.
+        kv_cache_groups, _mamba_groups = _split_groups_by_family(
+            kv_cache_config.kv_cache_groups
+        )
+        if not kv_cache_groups:
+            raise ValueError(
+                "kv_cache_config has no attention groups; a TT model with only "
+                "recurrent-state layers is not supported"
+            )
 
         if len(kv_cache_groups) == 1:
             spec = kv_cache_groups[0].kv_cache_spec
@@ -633,12 +740,13 @@ class TTModelRunner:
             per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
                 None
             ] * num_layers
+            uniform_dense = _dense_layer_indices(spec.kv_cache_specs.keys())
             for layer_name, layer_spec in spec.kv_cache_specs.items():
                 assert isinstance(layer_spec, AttentionSpec)
-                idx = _parse_layer_index(layer_name)
+                idx = uniform_dense[layer_name]
                 if not 0 <= idx < num_layers:
                     raise ValueError(
-                        f"Layer index {idx} parsed from '{layer_name}' is out "
+                        f"Layer index {idx} for '{layer_name}' is out "
                         f"of range for {num_layers} attention layers"
                     )
                 shape = self._kv_cache_shape(layer_spec, kv_cache_config.num_blocks)
@@ -659,6 +767,7 @@ class TTModelRunner:
             assert isinstance(group.kv_cache_spec, AttentionSpec)
             for layer_name in group.layer_names:
                 spec_by_layer_name[layer_name] = group.kv_cache_spec
+        attn_dense = _dense_layer_indices(spec_by_layer_name.keys())
 
         per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
             None
@@ -667,14 +776,16 @@ class TTModelRunner:
             for layer_name in kv_cache_tensor.shared_by:
                 spec = spec_by_layer_name.get(layer_name)
                 if spec is None:
-                    raise ValueError(
-                        f"KVCacheTensor.shared_by names layer '{layer_name}' "
-                        "but it doesn't appear in any kv_cache_group"
-                    )
-                idx = _parse_layer_index(layer_name)
+                    # Mamba layers legitimately appear in ``shared_by`` — hybrid
+                    # models align mamba and attention page sizes so the two
+                    # families can share a buffer (``mamba_page_size_padded``).
+                    # Recurrent state is allocated separately, so skip them here
+                    # rather than treating them as an unknown attention layer.
+                    continue
+                idx = attn_dense[layer_name]
                 if not 0 <= idx < num_layers:
                     raise ValueError(
-                        f"Layer index {idx} parsed from '{layer_name}' is "
+                        f"Layer index {idx} for '{layer_name}' is "
                         f"out of range for {num_layers} attention layers"
                     )
                 if per_layer[idx] is not None:
@@ -694,6 +805,109 @@ class TTModelRunner:
                 "kv_cache_tensors[i].shared_by"
             )
         return per_layer  # type: ignore[return-value]
+
+    @staticmethod
+    def _mamba_cache_shapes(
+        spec: MambaSpec, num_blocks: int
+    ) -> list[tuple[tuple[int, ...], Any]]:
+        """Per-buffer ``(shape, dtype)`` for one mamba layer's state pages.
+
+        Mirrors upstream's GPU allocation
+        (``gpu_model_runner._allocate_kv_cache_tensors``): a ``MambaSpec``
+        layer owns one buffer per ``(shape, dtype)`` pair in
+        ``zip(spec.shapes, spec.dtypes)``, each page-indexed as
+        ``(num_blocks, *shape)``. Upstream carves all of a layer's buffers out
+        of a single page-strided allocation; TT models allocate their own ttnn
+        tensors, so only the logical shape/dtype contract is reproduced here.
+
+        Unlike ``_kv_cache_shape``, no TP factor is folded in: mamba state is
+        replicated per rank, never sharded (``MambaManager`` undoes the base
+        class's DCP/PCP block-size scaling for exactly this reason).
+        """
+        if len(spec.shapes) != len(spec.dtypes):
+            raise ValueError(
+                f"MambaSpec declares {len(spec.shapes)} shapes but "
+                f"{len(spec.dtypes)} dtypes; they must correspond pairwise"
+            )
+        return [
+            ((num_blocks, *shape), dtype)
+            for shape, dtype in zip(spec.shapes, spec.dtypes)
+        ]
+
+    def _build_per_mamba_layer_specs(
+        self, kv_cache_config: KVCacheConfig, mamba_groups: list
+    ) -> list[list[tuple[tuple[int, ...], Any]]]:
+        """Resolve mamba groups → per-layer list of ``(shape, dtype)`` buffers.
+
+        Indexed densely by mamba-layer order (mamba layer 0 is the first
+        recurrent layer, not decoder layer 0 — see ``_dense_layer_indices``).
+        Entry ``i`` is the list of state buffers for mamba layer ``i``.
+        """
+        num_mamba_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, "mamba"
+        )
+        dense = _dense_layer_indices(
+            name for group in mamba_groups for name in group.layer_names
+        )
+        per_layer: list[list[tuple[tuple[int, ...], Any]] | None] = [
+            None
+        ] * num_mamba_layers
+        for group in mamba_groups:
+            spec = group.kv_cache_spec
+            assert isinstance(spec, MambaSpec)
+            buffers = self._mamba_cache_shapes(spec, kv_cache_config.num_blocks)
+            for layer_name in group.layer_names:
+                idx = dense[layer_name]
+                if not 0 <= idx < num_mamba_layers:
+                    raise ValueError(
+                        f"Mamba layer '{layer_name}' maps to dense index "
+                        f"{idx}, out of range for {num_mamba_layers} mamba "
+                        "layers"
+                    )
+                if per_layer[idx] is not None:
+                    raise ValueError(
+                        f"Mamba layer index {idx} (from '{layer_name}') is "
+                        "covered by more than one kv_cache_group"
+                    )
+                per_layer[idx] = buffers
+        missing = [i for i, e in enumerate(per_layer) if e is None]
+        if missing:
+            raise ValueError(
+                f"No KVCacheGroupSpec covers mamba layer indices {missing}; "
+                "every recurrent-state layer must appear in some group's "
+                "layer_names."
+            )
+        return per_layer  # type: ignore[return-value]
+
+    def _allocate_mamba_caches(
+        self, kv_cache_config: KVCacheConfig, mamba_groups: list
+    ) -> Any:
+        """Allocate recurrent-state caches for mamba groups, if any.
+
+        Returns ``None`` when the model declares no ``MambaSpec`` group, which
+        is every TT model today — so this is a no-op until a model's
+        ``get_kv_cache_spec`` hook starts declaring recurrent state.
+
+        A model that does declare one must implement
+        ``allocate_mamba_cache_per_layer(per_layer_specs)``, receiving one list
+        of ``(shape, dtype)`` buffers per mamba layer in dense mamba-layer
+        order.
+        """
+        if not mamba_groups:
+            return None
+        per_layer_specs = self._build_per_mamba_layer_specs(
+            kv_cache_config, mamba_groups
+        )
+        allocate = getattr(self.model, "allocate_mamba_cache_per_layer", None)
+        if allocate is None:
+            raise NotImplementedError(
+                f"{type(self.model).__name__} declares a MambaSpec kv cache "
+                "group but does not implement "
+                "allocate_mamba_cache_per_layer(per_layer_specs). Recurrent "
+                "state must be allocated through the kv cache contract for "
+                "vLLM to cache it at block boundaries."
+            )
+        return allocate(per_layer_specs)
 
     def _release_model_request(self, req_id: str) -> None:
         """Release model-owned state while the slot mapping is still valid.
