@@ -280,14 +280,38 @@ def test_build_per_mamba_layer_specs_rejects_buffer_smaller_than_one_page():
         TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
 
 
-def test_build_per_mamba_layer_specs_rejects_uncovered_layer():
-    spec = _mamba_spec(shapes=((4, 128, 128),), dtypes=(torch.float32,))
-    groups = [_group(["model.layers.0.linear_attn"], spec)]
-    stub = _runner_stub(num_mamba_layers=2)
-    config = _kv_cache_config({"model.layers.0.linear_attn": _MAMBA_PAGE_BYTES})
+def test_build_per_mamba_layer_specs_num_layers_comes_from_the_groups_themselves():
+    """num_mamba_layers is len(dense), derived from mamba_groups' own layer_names --
+    NOT from model_config.get_num_layers_by_block_type(parallel_config, "mamba"), which
+    only returns a nonzero count for hybrid families using that exact literal
+    (Jamba-style layers_block_type) and raises AssertionError for Qwen3Next/Qwen3.5-style
+    hybrids, whose layer_types says "linear_attention" instead -- a crash this test
+    previously couldn't catch because _runner_stub's mock hardcoded block_type == "mamba".
 
-    with pytest.raises(ValueError, match="No KVCacheGroupSpec covers mamba"):
-        TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
+    Because of that, a hole between what the model's own HF config reports and what its
+    groups cover (the old test_build_per_mamba_layer_specs_rejects_uncovered_layer
+    scenario) is no longer reachable: num_mamba_layers and the per-layer loop are both
+    derived from the exact same groups, by construction, so coverage is tautological.
+    The remaining real failure mode -- a layer referenced by a group but missing a
+    KVCacheTensor -- is covered by test_build_per_mamba_layer_specs_rejects_missing_tensor
+    below.
+    """
+    spec = _mamba_spec(shapes=((4, 128, 128),), dtypes=(torch.float32,))
+    groups = [_group(["model.layers.0.linear_attn", "model.layers.5.linear_attn"], spec)]
+    # num_mamba_layers passed to the stub is irrelevant now -- production code never
+    # calls get_num_layers_by_block_type -- so this also checks that.
+    stub = _runner_stub(num_mamba_layers=999)
+    config = _kv_cache_config(
+        {
+            "model.layers.0.linear_attn": _MAMBA_PAGE_BYTES,
+            "model.layers.5.linear_attn": _MAMBA_PAGE_BYTES,
+        }
+    )
+
+    per_layer = TTModelRunner._build_per_mamba_layer_specs(stub, config, groups)
+
+    assert len(per_layer) == 2
+    assert all(entry is not None for entry in per_layer)
 
 
 def test_allocate_mamba_caches_is_noop_without_mamba_groups():

@@ -545,12 +545,16 @@ class TTModelRunner:
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
             if mamba_groups:
-                num_mamba_layers = self.model_config.get_num_layers_by_block_type(
-                    self.parallel_config, "mamba"
-                )
                 mamba_dense = _dense_layer_indices(
                     name for group in mamba_groups for name in group.layer_names
                 )
+                # See the comment in _build_per_mamba_layer_specs: the
+                # block-type string get_num_layers_by_block_type wants is
+                # per-hybrid-family ("mamba" for Jamba, "linear_attention"
+                # for Qwen3Next/Qwen3.5) and raises for anything else, so
+                # len(mamba_dense) -- already exactly the declared mamba
+                # layer count -- is used instead of guessing it.
+                num_mamba_layers = len(mamba_dense)
                 mamba_mapping: list[int | None] = [None] * num_mamba_layers
                 for g_idx, group in enumerate(kv_cache_groups):
                     if not isinstance(group.kv_cache_spec, MambaSpec):
@@ -870,12 +874,18 @@ class TTModelRunner:
         recurrent layer, not decoder layer 0 — see ``_dense_layer_indices``).
         Entry ``i`` is the list of state buffers for mamba layer ``i``.
         """
-        num_mamba_layers = self.model_config.get_num_layers_by_block_type(
-            self.parallel_config, "mamba"
-        )
         dense = _dense_layer_indices(
             name for group in mamba_groups for name in group.layer_names
         )
+        # NOT get_num_layers_by_block_type(parallel_config, "mamba"): that
+        # method special-cases the literal block-type string per hybrid
+        # family (Jamba uses "mamba" in layers_block_type, Qwen3Next/Qwen3.5
+        # uses "linear_attention" in layer_types, and it raises for anything
+        # else), so a single call can only be right for one family at a time.
+        # len(dense) is universal -- it is already exactly the number of
+        # distinct layers the model declared across its own MambaSpec groups,
+        # by construction of _dense_layer_indices above.
+        num_mamba_layers = len(dense)
         # Block count is per layer, derived from that layer's own buffer size,
         # NOT from ``kv_cache_config.num_blocks`` (which is the attention
         # group's count). Upstream does the same:
