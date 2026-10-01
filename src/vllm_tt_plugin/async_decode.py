@@ -797,6 +797,15 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        # Recurrent-state page tables, for models whose GDN/SSM layers keep a
+        # vLLM-owned block store (see allocate_mamba_cache_per_layer).
+        # getattr, not attribute access: submit_decode is also called with
+        # duck-typed model inputs (lane/block runner tests build
+        # SimpleNamespace stubs), and this field is optional by construction.
+        # Mirrors the same kwarg submit_prefill already threads through.
+        mamba_tables = getattr(model_input, "mamba_block_tables_per_layer", None)
+        if mamba_tables is not None:
+            kwargs["mamba_page_tables_per_layer"] = mamba_tables
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
