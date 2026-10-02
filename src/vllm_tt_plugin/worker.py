@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -174,11 +175,39 @@ def _available_kv_cache_memory_bytes_for_num_blocks(
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes * num_blocks
 
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
-    )
-    return page_size * num_blocks * group_size
+    # A hybrid model (e.g. Qwen3.6's GDN/Mamba + attention layers) splits into
+    # MULTIPLE groups -- not just one attention group and one Mamba group, but
+    # one group per distinct equivalence class vLLM's hybrid manager forms
+    # (empirically, Qwen3.6-27B's 48 Mamba layers split into 3 groups of 16,
+    # same layer count as the 16-layer attention group). The old
+    # `page_size * num_blocks * group_size` formula picked ONE representative
+    # group_size and multiplied once -- correct ONLY when there is exactly one
+    # group whose cost scales with num_blocks and nothing else, but here it
+    # silently drops the other two Mamba groups' real (smaller, fixed) cost
+    # entirely. That made `available_memory` here claim ~2% less than
+    # kv_cache_utils.max_memory_usage_bytes ("needed_memory") computes for the
+    # SAME num_blocks, which only sums every raw layer spec's real cost
+    # directly -- so the engine failed to boot with "KV cache is needed...
+    # larger than available" even though num_blocks was sized correctly for
+    # the real DRAM budget (see get_num_available_blocks_tt).
+    #
+    # Fix: sum every GROUP's real contribution instead of picking one. A
+    # group's per-layer cost either scales with the pool size (attention-style
+    # -- MambaSpec is the one exception TT's align-mode caching introduces) or
+    # is fixed regardless of it (Mamba/GDN align-mode keeps a constant couple
+    # of live pages per layer, independent of how many blocks the pool has).
+    # Mirror kv_cache_utils.max_memory_usage_bytes's own per-spec dispatch for
+    # the fixed-cost case so this reconstruction can never drift from what the
+    # "needed" side actually computes.
+    total = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        n_layers = len(group.layer_names)
+        if isinstance(spec, MambaSpec):
+            total += n_layers * spec.max_memory_usage_bytes(vllm_config)
+        else:
+            total += n_layers * spec.page_size_bytes * num_blocks
+    return total
 
 
 class TTWorker(WorkerBase):
