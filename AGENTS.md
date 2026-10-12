@@ -94,7 +94,7 @@ There are two environments, and most work needs only the first.
 
 ### Host-only, no Tenstorrent hardware
 
-The whole unit suite runs on any machine. `ci/host-stubs/ttnn/` supplies an
+The whole unit suite runs on any machine. `tests/host-stubs/ttnn/` supplies an
 import-only `ttnn` stand-in whose every device-reaching entry point raises. A
 test that starts depending on real hardware fails loudly there rather than
 passing against a fake device. Work from the repository root. `uv` must
@@ -107,7 +107,7 @@ uv venv --python 3.12 "$VIRTUAL_ENV"
 uv pip install torch                # stands in for what tt-metal owns
 source docs/install-vllm-tt.sh      # note: sourced, not executed
 uv pip install "pytest>=8,<9" pre-commit
-PYTHONPATH=ci/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
+PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 ```
 
 `docs/install-vllm-tt.sh` must be **sourced**, not executed. It uses `return`
@@ -116,8 +116,8 @@ on failure because it is designed to run in the caller's shell.
 `pytest` is pinned below 9 because pytest 9's `caplog` attaches its own capture
 handler to non-propagating loggers and double-captures records (see
 `tests/test_logger.py`). That pin is **not** "match tt-metal": tt-metal
-`python_env` currently ships pytest 9.x. Plugin CI uses host stubs plus
-`pytest<9`. tt-metal's plugin host job uses real `ttnn` plus `.[dev]`. The
+`python_env` currently ships pytest 9.x. Plugin CI installs pytest through
+`.[dev]`, as does tt-metal's plugin host job. The
 `dev` extra pins `pytest>=8,<9` so `uv pip install -e ".[dev]"` cannot float
 to 9. Do not install an unpinned pytest over that extra.
 
@@ -212,12 +212,31 @@ this repository does not carry SPDX headers.
 
 ## 5. Continuous integration
 
-`.github/workflows/ci.yaml` runs two jobs on every pull request:
+`.github/workflows/lint-and-host-tests.yaml` runs on pull requests into `main`
+and `release/*` that are not drafts: when opened, reopened, pushed to, or
+marked ready for review. Draft pull requests run nothing, and converting a
+pull request to draft cancels its run in progress. Its jobs:
 
 - `pre-commit` on `ubuntu-latest`
-- `unit-tests` on Python 3.10 and 3.12, which installs through
-  `docs/install-vllm-tt.sh`. That job therefore also fails when the documented
-  install path rots, which is intentional.
+- `host-tests-stubbed` on Python 3.10 and 3.12 with `tests/host-stubs`, which
+  installs through `docs/install-vllm-tt.sh`. That job therefore also fails
+  when the documented install path rots, which is intentional.
+- `host-tests-ttnn` with real `ttnn`, inside tt-metal's Ubuntu 22.04 and 24.04
+  release images for the latest stable tag and the latest release tag (dev or
+  rc). Its failures show on the pull request but do not block merging, and
+  `required-checks` does not wait for it. A `workflow_dispatch` run
+  can name one tt-metal tag instead.
+- `required-checks`, which fails unless `pre-commit` and every
+  `host-tests-stubbed` leg pass. It is the check to require in the branch
+  ruleset, so matrix changes never touch the ruleset.
+
+Torch comes from tt-metal's `tt_metal/python_env/requirements-dev.txt`, read by
+`.github/scripts/tt-metal-torch-pin.sh`: `host-tests-ttnn` installs the pin of
+the tag each leg tests, and `host-tests-stubbed`, which tests no tag, installs
+the latest stable tag's pin. The two lookups are separate jobs:
+`resolve-stable` feeds the required path, and `resolve-tt-metal` feeds only
+`host-tests-ttnn`, so a newer or requested tag that cannot be resolved fails
+only the advisory job. Both test jobs install pytest through the `dev` extra.
 
 **There is no hardware CI in this repository.** Plugin pull requests do not
 dispatch tt-metal `vllm-model-tests`. That workflow is workflow_dispatch, and
@@ -225,10 +244,6 @@ its plugin ref defaults to `main`. Device-affecting plugin changes still need a
 pasted host, model, and mesh result in Validation, or a named tt-metal job
 with `vllm-tt-plugin-ref` set to this branch. The pull request template has a
 `Validation` section for exactly this.
-
-Known dead configuration: `ci.yaml` has a `push: branches: [dev]` trigger, but
-the default branch is `main` and no `dev` branch exists on the remote. That
-trigger never fires.
 
 ## 6. Model capabilities: the gating contract
 

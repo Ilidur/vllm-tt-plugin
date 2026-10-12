@@ -835,15 +835,15 @@ Plugin-local unit tests that do not require a running server live directly
 under `tests/`, for example:
 
 ```bash
-pytest tests/test_lane_scheduler.py
+"$VIRTUAL_ENV/bin/python" -m pytest tests/test_lane_scheduler.py
 ```
 
 These need no Tenstorrent hardware, only an importable `ttnn`. On a host without
-tt-metal, put the CI stub on the path instead. This is what the `unit-tests`
-workflow job runs:
+tt-metal, put the CI stub on the path instead. This is what the
+`host-tests-stubbed` workflow job runs:
 
 ```bash
-PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
+PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 ```
 
 The stub answers only the device-independent `ttnn` names the plugin touches and
