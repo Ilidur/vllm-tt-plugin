@@ -8,6 +8,7 @@ import os
 import sys
 import weakref
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from functools import wraps
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
@@ -59,6 +60,10 @@ else:
     FlexibleArgumentParser = object
 
 logger = init_tt_logger(__name__)
+
+_tt_request_vllm_config: ContextVar["VllmConfig | None"] = ContextVar(
+    "tt_request_vllm_config", default=None
+)
 
 _STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
 _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
@@ -975,8 +980,13 @@ def _neutralize_model_owned_sampling(params) -> list[str]:
     return ignored
 
 
-def _install_block_output_input_processor_patch() -> None:
-    """Reject unsupported resumable requests and own block-output defaults.
+def _install_tt_input_processor_patch() -> None:
+    """Scope request admission to its engine and own block-output defaults.
+
+    Platform.validate_request receives no VllmConfig. Bind the requesting
+    InputProcessor's VllmConfig for that call so another live engine cannot
+    replace its speculative admission policy. ContextVar keeps concurrent
+    calls separate and restores the outer engine after a nested request.
 
     vLLM 0.25.1 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
@@ -1009,7 +1019,11 @@ def _install_block_output_input_processor_patch() -> None:
         unresolved_max_tokens = (
             isinstance(params, SamplingParams) and params.max_tokens is None
         )
-        request = original(self, request_id, prompt, params, *args, **kwargs)
+        token = _tt_request_vllm_config.set(self.vllm_config)
+        try:
+            request = original(self, request_id, prompt, params, *args, **kwargs)
+        finally:
+            _tt_request_vllm_config.reset(token)
 
         cloned_params = request.sampling_params
         if not is_block_output_model or cloned_params is None:
@@ -2218,8 +2232,8 @@ class TTPlatform(Platform):
                 )
                 model_config.generation_config = "vllm"
 
+        _install_tt_input_processor_patch()
         if is_block_output_model:
-            _install_block_output_input_processor_patch()
             _install_block_output_streaming_input_patch()
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()
@@ -2495,29 +2509,38 @@ class TTPlatform(Platform):
         and commits ids. That certifies plain greedy decoding exactly, and
         nothing else.
 
-        Controls the ORDINARY decode path can honour are no longer refused --
-        a non-zero temperature and the penalties are served by simply not
-        speculating for that request (``TTModelRunner._request_is_speculable``
-        offers no drafts, and the runner applies its full sampling). Refusing
-        them made a speculating launch unusable for any sampled client and, in
-        our case, failed every prompt of two standard evals with HTTP 400.
+        A non-zero temperature and the penalties are served without
+        speculation where the launch has an ordinary decode to serve them
+        with. On a model that declares ``supports_narrow_decode``,
+        ``TTModelRunner._publish_draft`` offers such a request no drafts, and
+        every step it shares runs as the ordinary decode, which applies its
+        full sampling (``_step_verifies`` in the runner). Refusing them would
+        make a speculating launch unusable for any sampled client. A model
+        without ``supports_narrow_decode`` sends every decode step as a verify,
+        which commits the target argmax on every row, so there the request is
+        refused.
 
-        What remains here is what no path on this launch serves: controls that
-        need logits or a token filter the model-owned sampler does not apply.
-        A request asking for those would be answered without them, silently --
-        a grammar or token filter unapplied, requested logprobs arriving empty.
+        Refused on every speculating launch: controls that need logits or a
+        token filter the model-owned sampler does not apply. A request asking
+        for those would be answered without them, silently -- a grammar or
+        token filter unapplied, requested logprobs arriving empty.
 
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
         """
-        vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingType
+
+        vllm_config = _tt_request_vllm_config.get()
+        if vllm_config is None:
+            # Direct platform callers have no InputProcessor request context.
+            vllm_config = cls._resolve_tt_admission_handle()
+        spec_plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+        if spec_plan is None:
             return
 
         unsupported = []
-        # temperature / min_p / the penalties are intentionally absent: those
-        # requests are decoded without speculation instead of being refused.
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r}")
         if getattr(params, "structured_outputs", None) is not None:
@@ -2531,16 +2554,48 @@ class TTPlatform(Platform):
         if params.min_tokens:
             unsupported.append(f"min_tokens={params.min_tokens!r}")
 
+        # The same four conditions under which vLLM's InputBatch.add_request
+        # files the request into random_reqs or a penalty set, which is what
+        # TTModelRunner._request_is_speculable reads. min_p, top_p and top_k
+        # are absent because they do not move a greedy request's argmax.
+        sampled = []
+        if not spec_plan.supports_narrow_decode:
+            if params.sampling_type != SamplingType.GREEDY:
+                sampled.append(f"temperature={params.temperature!r}")
+            for name, neutral in (
+                ("presence_penalty", 0.0),
+                ("frequency_penalty", 0.0),
+                ("repetition_penalty", 1.0),
+            ):
+                if getattr(params, name) != neutral:
+                    sampled.append(f"{name}={getattr(params, name)!r}")
+
+        if not unsupported and not sampled:
+            return
+        reasons = []
         if unsupported:
-            raise ValueError(
-                f"Speculative decoding on {cls.device_name} cannot serve this "
-                f"request's {unsupported}. No path on this launch applies "
-                "those, so answering without them would change what was asked "
-                "for without saying so. Sampled requests (temperature, "
-                "min_p, the penalties) ARE served here -- they simply decode "
-                "without speculation. Drop the controls above, or drop the "
-                "speculative flags from the server"
+            reasons.append(
+                f"No path on this launch applies {unsupported}, so answering "
+                "without them would change what was asked for without saying "
+                "so."
             )
+        if sampled:
+            reasons.append(
+                "This launch's model sends every decode step as a verify (its "
+                "SpecPlan does not keep supports_narrow_decode), and a verify "
+                f"commits the target argmax on every row, so {sampled} would "
+                "not be applied. Send temperature 0 without penalties."
+            )
+        elif spec_plan.supports_narrow_decode:
+            reasons.append(
+                "Sampled requests (temperature, the penalties) ARE served "
+                "here -- they simply decode without speculation."
+            )
+        raise VLLMValidationError(
+            f"Speculative decoding on {cls.device_name} cannot serve this "
+            f"request's {unsupported + sampled}. {' '.join(reasons)} Drop the "
+            "controls above, or drop the speculative flags from the server"
+        )
 
     @classmethod
     def validate_request(
@@ -2549,15 +2604,16 @@ class TTPlatform(Platform):
         params: "SamplingParams | PoolingParams",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
+        from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingParams
 
         dev = cls.device_name
 
         if processed_inputs.get("prompt_embeds") is not None:
-            raise ValueError(f"prompt_embeds are not supported on {dev}")
+            raise VLLMValidationError(f"prompt_embeds are not supported on {dev}")
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
-            raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+            raise VLLMValidationError(f"Not yet supporting prompt_logprobs on {dev}")
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)
@@ -2580,7 +2636,7 @@ class TTPlatform(Platform):
 
         # Reject unsupported response-contract controls. Model-owned sampling
         # controls (temperature etc.) are instead accepted and neutralized on
-        # the per-request clone in _install_block_output_input_processor_patch.
+        # the per-request clone in _install_tt_input_processor_patch.
         unsupported = []
         if params.n != 1:
             unsupported.append(f"n={params.n!r} (accepted: 1)")
