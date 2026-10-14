@@ -45,6 +45,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
     is_tt_adaptive_block_output_model,
@@ -326,6 +327,7 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
+        self.seeded_sampling_policy = get_tt_seeded_sampling_policy(vllm_config)
         if self.supports_device_grammar and (
             self.sample_on_device_mode is None or self.scheduler_config.async_scheduling
         ):
@@ -3190,7 +3192,7 @@ class TTModelRunner:
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
         max_top_k = self.model.model_capabilities.get("max_device_top_k")
-        if max_top_k is not None:
+        if max_top_k is not None or self.seeded_sampling_policy == "host":
             sampling = input_batch.sampling
             # Prefill can submit only a subset of the resident lane requests.
             # An unscheduled decode request must not change its sampling route.
@@ -3200,6 +3202,15 @@ class TTModelRunner:
                 if sampling_rows is None
                 else sampling_rows
             )
+            # One forward has one sampler. Under the explicit host policy,
+            # every submitted seeded request keeps host RNG ownership through
+            # prefill and decode, including when its companions change.
+            if (
+                self.seeded_sampling_policy == "host"
+                and (sampling.seed[rows] != SEED_NONE_SENTINEL).any()
+            ):
+                return False
+        if max_top_k is not None:
             temperature = sampling.temperature[rows]
             top_k = sampling.top_k[rows]
             needs_unbounded_or_larger_k = (temperature != 0) & (
