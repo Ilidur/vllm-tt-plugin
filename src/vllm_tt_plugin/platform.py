@@ -520,7 +520,35 @@ def _model_folds_dp_into_lanes(model_class) -> bool:
     """
     if _galaxy_generator_version() is not None:
         return True
+    # A model class declares the fold itself through
+    # ``model_capabilities["folds_dp_into_lanes"]`` (e.g. gemma4's Galaxy
+    # one-instance lanes), so an env-gated rail opts in without a plugin
+    # change per model.
+    if _model_capability_flag(model_class, "folds_dp_into_lanes"):
+        return True
     return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
+
+
+def _model_capability_flag(model_class, key: str) -> bool:
+    """A Boolean ``model_capabilities`` entry, or a zero-argument callable one.
+
+    The lane declarations may depend on the serving environment (an env-gated
+    rail), so a model may declare them as callables that the platform evaluates
+    at config time. A declaration that raises fails the launch: silently falling
+    back to standard DP would run the model in the wrong execution mode.
+    """
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    value = capabilities.get(key, False)
+    if callable(value):
+        try:
+            value = value()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{getattr(model_class, '__name__', model_class)}."
+                f"model_capabilities[{key!r}] raised while resolving the lane "
+                f"declaration: {exc}"
+            ) from exc
+    return bool(value)
 
 
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
