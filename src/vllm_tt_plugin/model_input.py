@@ -138,7 +138,9 @@ class TTModelInput:
 
     # Lists preserve the sampling-helper interface; each independent runner and
     # each merged lane step supplies one element.
-    # If not used, [None]
+    # If not used, [None]. ``[rows, W]`` packed for a step that commits one
+    # token per row; ``[rows, 1+K, W]``, one row per candidate column, for a
+    # verify.
     grammar_bitmask: list[torch.Tensor | None]
 
     # Host-only sampling params. Each independent rank supplies one list entry;
@@ -222,3 +224,31 @@ class TTModelInput:
     # Immutable row identity used for sample-time grammar remapping. Includes
     # padding/gap rows as None and is never reconstructed from a mutable batch.
     grammar_row_req_ids: tuple[str | None, ...] = ()
+
+    # Speculating launch only, every build. How many grammar bitmask rows the
+    # scheduler writes for each scheduled request: one per scheduled draft
+    # position plus one for the bonus, so a structured request owns several
+    # consecutive rows rather than one. ``None`` on a launch that does not
+    # speculate, whose bitmask holds one row per structured request.
+    grammar_rows_per_request: dict[str, int] | None = None
+
+    # ``logits`` verify only. Row to ``(remaining, stop_token_ids)`` for each
+    # live row whose output is still shorter than its ``min_tokens``, captured
+    # at build time, because the walk may run on the readback thread after the
+    # request's output has grown.
+    spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+
+def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
+    """Each row's committed output, with TT's -1 padding removed."""
+    return [[token for token in row.tolist() if token != -1] for row in output_tokens]
+
+
+def penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Prompt ids as vLLM's penalty op reads them.
+
+    int64, with TT's -1 padding replaced by the vocabulary size, which is the
+    one index the op's bin count ignores.
+    """
+    ids = prompt_tokens.to(torch.int64)
+    return ids.masked_fill(ids == -1, vocab_size)
