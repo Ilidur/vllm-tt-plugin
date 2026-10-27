@@ -621,7 +621,13 @@ def _random_walk(
     noise, pending = _start_walk_noise(
         rows, num_drafts, vocab, num_valid_drafts, generators
     )
-    probs = _constrained_probs(target_logits, temperature, top_k, top_p)
+    probs = _constrained_probs(
+        target_logits,
+        temperature,
+        top_k,
+        top_p,
+        seeded_rows=frozenset(generators),
+    )
     # Replaced inside the vocabulary before any gather, because a draft column
     # past its row's count holds padding, the runner pads with
     # PLACEHOLDER_TOKEN_ID, and torch.gather refuses a negative index rather
@@ -687,6 +693,7 @@ def _constrained_probs(
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    seeded_rows: frozenset[int] = frozenset(),
 ) -> torch.Tensor:
     """Target probabilities after temperature, top-k and top-p.
 
@@ -694,6 +701,21 @@ def _constrained_probs(
     asked for, so the constraints belong before the accept test rather than
     after it. Every row is a random row: ``accept_speculated_tokens`` keeps
     greedy rows off this path.
+
+    Top-k and top-p follow vLLM's PyTorch implementation, which sorts the
+    whole vocabulary of every candidate column; that sort is most of the
+    walk's cost. Two cases avoid it:
+
+    - Top-k without top-p uses vLLM's ``apply_top_k_only``, which keeps every
+      logit at least the k-th largest, the same set the sort keeps.
+    - Top-k with top-p, for a row outside ``seeded_rows`` whose top-k is
+      below the vocabulary size and at most ``_MAX_UNSORTED_TOP_K``, uses
+      ``_top_k_top_p_without_sort`` whatever the other rows carry. Its top-p
+      cut can differ from the sort's where two logits tie at the cut or where
+      a cumulative sum lands within rounding of ``1 - p``. A seeded row keeps
+      the sort, so it commits exactly what the ordinary host sampler, which
+      uses the same sort, commits. A row with top-p but no top-k also keeps
+      the sort.
 
     The caller's tensor is not modified: a caller that also wants logprobs
     needs the raw logits afterwards.
@@ -704,21 +726,85 @@ def _constrained_probs(
     if top_k is not None or top_p is not None:
         # Deferred: vllm.v1.sample.ops resolves current_platform at import
         # time, which loads this plugin, so importing it at module scope from
-        # inside the plugin is a cycle. The pytorch entry point is named
+        # inside the plugin is a cycle. The pytorch entry points are named
         # directly rather than the dispatching apply_top_k_top_p, which would
         # route to Triton on a machine that has it and to torch here, and
         # the two are not required to break ties identically.
-        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+        from vllm.v1.sample.ops.topk_topp_sampler import (
+            apply_top_k_only,
+            apply_top_k_top_p_pytorch,
+        )
 
         flat = logits.reshape(rows * width, vocab)
-        flat = apply_top_k_top_p_pytorch(
-            flat,
-            None if top_k is None else _expand_to_columns(top_k, width),
-            None if top_p is None else _expand_to_columns(top_p, width),
-        )
+        k = None if top_k is None else _expand_to_columns(top_k, width)
+        p = None if top_p is None else _expand_to_columns(top_p, width)
+        if p is None:
+            flat = apply_top_k_only(flat, k)
+        else:
+            # Per row, so a seeded row, or a row without a top-k (the input
+            # batch stores the vocabulary size), puts only itself on the sort.
+            unsorted = (
+                []
+                if top_k is None
+                else [
+                    row
+                    for row, row_k in enumerate(top_k.tolist())
+                    if row not in seeded_rows
+                    and row_k < vocab
+                    and row_k <= _MAX_UNSORTED_TOP_K
+                ]
+            )
+            unsorted_set = set(unsorted)
+            sorted_rows = [row for row in range(rows) if row not in unsorted_set]
+            for subset, apply in (
+                (unsorted, _top_k_top_p_without_sort),
+                (sorted_rows, apply_top_k_top_p_pytorch),
+            ):
+                if not subset:
+                    continue
+                if len(subset) == rows:
+                    flat = apply(flat, k, p)
+                    continue
+                columns = [
+                    row * width + column for row in subset for column in range(width)
+                ]
+                flat[columns] = apply(
+                    flat[columns], None if k is None else k[columns], p[columns]
+                )
         logits = flat.reshape(rows, width, vocab)
 
     return logits.softmax(dim=-1, dtype=torch.float32)
+
+
+# The largest top-k ``_top_k_top_p_without_sort`` serves. Above it, its
+# ``topk`` approaches the cost of the sort it replaces.
+_MAX_UNSORTED_TOP_K = 1024
+
+
+def _top_k_top_p_without_sort(
+    logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor
+) -> torch.Tensor:
+    """vLLM's top-k then top-p masks on ``[N, V]`` logits, from the k largest.
+
+    Top-k keeps every logit at least the k-th largest, as vLLM does. vLLM's
+    top-p then drops a token when the probability at or below it, summed in
+    ascending order over the top-k distribution, is at most ``1 - p``; this
+    keeps a token while the probability strictly above it, summed in
+    descending order, is below ``p``. That is the same cut unless two logits
+    tie at it or a sum lands within rounding of the boundary. The largest
+    token always stays, and a top-p of 1 keeps the whole top-k, as in vLLM.
+    Modifies ``logits`` in place.
+    """
+    values = logits.topk(int(k.max()), dim=-1).values
+    kth = values.gather(1, (k.to(torch.int64) - 1).unsqueeze(1))
+    probs = values.masked_fill(values < kth, float("-inf")).softmax(dim=-1)
+    above = probs.cumsum(dim=-1) - probs
+    # At a top-p of 1 the descending sum can round to 1 before a top-k token
+    # whose probability is below float32 rounding of 1, which vLLM keeps.
+    within_p = (above < p.unsqueeze(1)) | (p.unsqueeze(1) >= 1.0)
+    kept = within_p.sum(dim=-1, keepdim=True).clamp(min=1)
+    cut = torch.maximum(kth, values.gather(1, kept - 1))
+    return logits.masked_fill_(logits < cut, float("-inf"))
 
 
 def _race_argmax(weights: torch.Tensor, race: torch.Tensor) -> torch.Tensor:

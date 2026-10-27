@@ -550,12 +550,15 @@ def test_seeded_rows_do_not_draw_from_the_global_stream():
 # region Sampling constraints
 
 
-def test_top_k_of_one_makes_a_random_row_behave_greedily():
+@pytest.mark.parametrize("top_p", [None, 0.0], ids=["top-k only", "top-p of 0"])
+def test_top_k_of_one_makes_a_random_row_behave_greedily(top_p: float | None):
     """The constraints apply before the accept test, not after it.
 
     The distribution acceptance must preserve is the one the operator asked
     for. With top-k of 1 the target is a point mass at its argmax, so a random
-    row commits exactly what a greedy row would.
+    row commits exactly what a greedy row would. The input batch pairs a top-k
+    of 1 with a top-p of 0, whose top-p cut keeps no token before the unsorted
+    cut's floor of one.
     """
     logits = torch.randn(4, 3, VOCAB)
     drafts = torch.tensor([[1, 2]] * 4, dtype=torch.int32)
@@ -573,6 +576,7 @@ def test_top_k_of_one_makes_a_random_row_behave_greedily():
         num_valid_drafts=num_valid,
         temperature=torch.ones(4),
         top_k=torch.ones(4, dtype=torch.int32),
+        top_p=None if top_p is None else torch.full((4,), top_p),
     )
 
     assert torch.equal(greedy.accepted_counts, constrained.accepted_counts)
@@ -626,6 +630,105 @@ def test_top_k_and_top_p_together_constrain_the_committed_distribution():
 
     committed = set(result.committed_token_ids[:, 0].tolist())
     assert committed <= {0, 1}, f"committed outside the top 2: {sorted(committed)}"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "random k and p",
+        "top-p of 1 on some rows",
+        "top-k of 1 with top-p of 0 on some rows",
+        "seeded rows among unseeded rows",
+        "rows without top-k",
+    ],
+)
+def test_the_unsorted_top_k_top_p_cut_matches_the_sorted_one(case: str):
+    """Without ties, the cut from the k largest logits equals vLLM's sorted cut.
+
+    An unseeded row with a top-k takes the unsorted path, which skips sorting
+    the whole vocabulary of every candidate column. The two cuts can differ
+    only where logits tie at the cut or a cumulative sum lands within rounding
+    of ``1 - p``; random float32 logits have no ties, and with this seed no
+    sum lands that close.
+
+    The cases mix rows that each lean on one part of the unsorted cut or of
+    the per-row split. A top-p of 1 keeps the zero-probability tail of a row
+    whose k is below the largest k it is cut with, which only the floor at
+    the k-th logit removes; those rows' logits are also spread so far that
+    their smallest top-k probabilities lie below float32 rounding of 1, where
+    a descending sum reaches 1 before them but vLLM still keeps them. A top-k
+    of 1, which the input batch pairs with a top-p of 0, keeps no token before
+    the floor of one. Seeded rows, and rows whose top-k is the vocabulary
+    size, take the sort while their neighbours do not, so their results are
+    written back into a shared batch.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from vllm_tt_plugin.spec_accept import _constrained_probs
+
+    generator = torch.Generator().manual_seed(3)
+    rows, width, vocab = 64, 4, 2048
+    logits = torch.randn(rows, width, vocab, generator=generator) * 3.0
+    temperature = torch.full((rows,), 0.7)
+    k = torch.randint(1, 64, (rows,), dtype=torch.int32, generator=generator)
+    p = torch.rand(rows, generator=generator) * 0.9 + 0.1
+    seeded_rows: frozenset[int] = frozenset()
+    if case == "top-p of 1 on some rows":
+        p[::3] = 1.0
+        logits[::3] *= 4.0
+    elif case == "top-k of 1 with top-p of 0 on some rows":
+        k[::3] = 1
+        p[::3] = 0.0
+    elif case == "seeded rows among unseeded rows":
+        seeded_rows = frozenset(range(0, rows, 2))
+    elif case == "rows without top-k":
+        k[::4] = vocab
+
+    sorted_cut = apply_top_k_top_p_pytorch(
+        (logits / temperature.view(rows, 1, 1)).reshape(rows * width, vocab),
+        k.repeat_interleave(width),
+        p.repeat_interleave(width),
+    )
+    probs = _constrained_probs(logits, temperature, k, p, seeded_rows=seeded_rows)
+
+    assert torch.equal(probs, sorted_cut.softmax(dim=-1).reshape(rows, width, vocab))
+
+
+@pytest.mark.parametrize("vocab", [8, 2048])
+def test_a_row_that_needs_the_sort_does_not_send_its_neighbours_to_it(
+    monkeypatch, vocab: int
+):
+    """Only seeded rows and rows without a top-k sort.
+
+    The input batch stores a row without a top-k as the vocabulary size, and a
+    seeded row keeps the ordinary sampler's sort. A vocabulary below the
+    unsorted limit must still send a row without a top-k to the sort. An
+    unseeded row with a small top-k next to either still takes the unsorted
+    cut, so the sort receives only the columns of the rows that need it.
+    """
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    from vllm_tt_plugin.spec_accept import _constrained_probs
+
+    sort = topk_topp_sampler.apply_top_k_top_p_pytorch
+    sorted_columns = []
+
+    def recording_sort(logits, *args, **kwargs):
+        sorted_columns.append(logits.shape[0])
+        return sort(logits, *args, **kwargs)
+
+    monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_pytorch", recording_sort)
+    rows, width = 4, 3
+
+    _constrained_probs(
+        torch.randn(rows, width, vocab),
+        torch.ones(rows),
+        top_k=torch.tensor([2, vocab, 2, 2], dtype=torch.int32),
+        top_p=torch.full((rows,), 0.9),
+        seeded_rows=frozenset({2}),
+    )
+
+    assert sorted_columns == [2 * width]
 
 
 def test_the_caller_s_logits_are_not_modified():
